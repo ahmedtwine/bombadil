@@ -252,6 +252,7 @@ fn optional_duration_from_js(value: JsValue) -> Result<Option<Duration>> {
     Ok(Some(Duration::from_millis(millis as u64)))
 }
 
+#[derive(Debug)]
 pub struct BombadilExports {
     pub formula: JsValue,
     pub pure: JsValue,
@@ -263,7 +264,7 @@ pub struct BombadilExports {
     pub next: JsValue,
     pub always: JsValue,
     pub eventually: JsValue,
-    pub runtime_default: JsObject,
+    pub runtime: JsObject,
     pub time: JsObject,
     pub action_generator: JsValue,
 }
@@ -291,9 +292,43 @@ impl BombadilExports {
             next: get_export("Next")?,
             always: get_export("Always")?,
             eventually: get_export("Eventually")?,
-            runtime_default: get_export("runtimeDefault")?.as_object().ok_or(
+            runtime: get_export("runtime")?.as_object().ok_or(
                 SpecificationError::OtherError(
-                    "runtimeDefault is not an object".to_string(),
+                    "runtime is not an object".to_string(),
+                ),
+            )?,
+            time: get_export("time")?.as_object().ok_or(
+                SpecificationError::OtherError(
+                    "time is not an object".to_string(),
+                ),
+            )?,
+            action_generator: get_export("ActionGenerator")?,
+        })
+    }
+
+    pub fn from_object(obj: &JsObject, context: &mut Context) -> Result<Self> {
+        let mut get_export = |name: &str| -> Result<JsValue> {
+            obj.get(js_string!(name), context).map_err(|e| {
+                SpecificationError::OtherError(format!(
+                    "Failed to get {}: {}",
+                    name, e
+                ))
+            })
+        };
+        Ok(Self {
+            formula: get_export("Formula")?,
+            pure: get_export("Pure")?,
+            thunk: get_export("Thunk")?,
+            not: get_export("Not")?,
+            and: get_export("And")?,
+            or: get_export("Or")?,
+            implies: get_export("Implies")?,
+            next: get_export("Next")?,
+            always: get_export("Always")?,
+            eventually: get_export("Eventually")?,
+            runtime: get_export("runtime")?.as_object().ok_or(
+                SpecificationError::OtherError(
+                    "runtime is not an object".to_string(),
                 ),
             )?,
             time: get_export("time")?.as_object().ok_or(
@@ -319,49 +354,29 @@ pub fn module_exports(
 }
 
 pub struct Extractors {
-    next_id: u64,
-    instances: HashMap<u64, JsObject>,
+    instances: Vec<JsObject>,
     time: JsObject,
 }
 
 impl Extractors {
     pub fn new(bombadil_exports: &BombadilExports) -> Self {
         Self {
-            next_id: 0,
-            instances: HashMap::new(),
+            instances: vec![],
             time: bombadil_exports.time.clone(),
         }
     }
 
-    pub fn register(&mut self, obj: JsObject) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.instances.insert(id, obj);
-        id
+    pub fn register(&mut self, obj: JsObject) {
+        self.instances.push(obj);
     }
 
-    pub fn get(&self, id: u64) -> Option<&JsObject> {
-        self.instances.get(&id)
-    }
-
-    pub fn extract_functions(
-        &self,
-        context: &mut Context,
-    ) -> Result<HashMap<u64, String>> {
-        let mut functions = HashMap::new();
-
-        for (&id, obj) in &self.instances {
-            let func = obj.get(js_string!("extract"), context)?;
-            functions
-                .insert(id, func.to_string(context)?.to_std_string_lossy());
-        }
-
-        Ok(functions)
+    pub fn get(&self, index: usize) -> Option<&JsObject> {
+        self.instances.get(index)
     }
 
     pub fn update_from_snapshots(
         &self,
-        results: Vec<(u64, json::Value)>,
+        results: Vec<json::Value>,
         time: SystemTime,
         context: &mut Context,
     ) -> Result<()> {
@@ -398,9 +413,9 @@ impl Extractors {
 
         update(&self.time, JsValue::null(), time.clone(), context)?;
 
-        for (id, json_result) in results {
-            if let Some(obj) = self.get(id) {
-                let js_value = JsValue::from_json(&json_result, context)?;
+        for (index, json_result) in results.iter().enumerate() {
+            if let Some(obj) = self.get(index) {
+                let js_value = JsValue::from_json(json_result, context)?;
                 update(obj, js_value, time.clone(), context)?;
             }
         }

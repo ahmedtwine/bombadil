@@ -7,7 +7,7 @@ import {
 } from "@antithesishq/bombadil/internal";
 
 /** @internal */
-export const runtimeDefault = new Runtime<State>();
+export const runtime = new Runtime<State>();
 
 // Reexports
 export { time, type Cell } from "@antithesishq/bombadil/internal";
@@ -220,7 +220,7 @@ export function eventually(x: IntoFormula): Eventually {
 }
 
 export function extract<T extends JSON>(query: (state: State) => T): Cell<T> {
-  return new ExtractorCell<T, State>(runtimeDefault, query);
+  return new ExtractorCell<T, State>(runtime, query);
 }
 
 export interface State {

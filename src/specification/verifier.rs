@@ -1,67 +1,20 @@
-use std::path::{Path, PathBuf};
-use std::{collections::HashMap, rc::Rc};
+use std::collections::HashMap;
 
-use crate::specification::js::{
-    BombadilExports, Extractors, RuntimeFunction, module_exports,
-};
-use crate::specification::module_loader::transpile;
+use crate::specification::js::{BombadilExports, Extractors, RuntimeFunction};
+use crate::specification::ltl::{Evaluator, Formula, Residual, Violation};
 use crate::specification::result::Result;
 use crate::specification::syntax::Syntax;
-use crate::specification::{ltl, module_loader::load_modules};
+use crate::specification::{ltl, result::SpecificationError};
 use crate::tree::Tree;
 use boa_engine::{
-    Context, JsString, Module, NativeFunction, Source,
+    Context, JsString, NativeFunction, Source,
     context::ContextBuilder,
     js_string,
     object::builtins::{JsArray, JsUint8Array},
     property::PropertyKey,
 };
 use boa_engine::{JsError, JsObject, JsValue};
-use oxc::span::SourceType;
 use serde_json as json;
-
-use crate::specification::{
-    ltl::{Evaluator, Formula, Residual, Violation},
-    module_loader::{HybridModuleLoader, load_bombadil_module},
-    result::SpecificationError,
-};
-
-#[derive(Clone, Debug)]
-pub struct Specification {
-    contents: Vec<u8>,
-    path: PathBuf,
-}
-
-impl Specification {
-    pub async fn from_path(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let contents = tokio::fs::read_to_string(path)
-            .await
-            .map_err(SpecificationError::IO)?;
-        Self::from_string(&contents, path)
-    }
-    pub fn from_string(contents: &str, path: impl AsRef<Path>) -> Result<Self> {
-        let path: &Path = path.as_ref();
-        let source_type = SourceType::from_path(path).map_err(|error| {
-            SpecificationError::OtherError(error.to_string())
-        })?;
-        let contents =
-            if [SourceType::cjs(), SourceType::mjs()].contains(&source_type) {
-                contents.to_string()
-            } else {
-                log::debug!(
-                    "transpiling {} ({:?}) to javascript",
-                    path.display(),
-                    &source_type,
-                );
-                transpile(contents, path, &source_type)?
-            };
-        Ok(Specification {
-            contents: contents.into_bytes(),
-            path: path.to_path_buf(),
-        })
-    }
-}
 
 #[derive(Clone)]
 pub struct StepResult<A> {
@@ -75,22 +28,21 @@ pub struct Verifier {
     properties: HashMap<String, Property>,
     action_generators: HashMap<String, ActionGenerator>,
     extractors: Extractors,
-    extractor_functions: HashMap<u64, String>,
 }
 
 const RANDOM_BYTES_COUNT_MAX: usize = 4096;
 
-impl Verifier {
-    pub fn new(specification: Specification) -> Result<Self> {
-        let loader = Rc::new(HybridModuleLoader::new()?);
+#[derive(Clone)]
+pub struct Specification {
+    pub module_specifier: String,
+}
 
-        // Instantiate the execution context
+impl Verifier {
+    pub fn new(bundle_code: &str) -> Result<Self> {
         let mut context = ContextBuilder::default()
-            .module_loader(loader.clone())
             .build()
             .map_err(|error| SpecificationError::JS(error.to_string()))?;
 
-        // Expose random byte generation to JS
         context.register_global_builtin_callable(
             js_string!("__bombadil_random_bytes"),
             1,
@@ -113,70 +65,98 @@ impl Verifier {
             }),
         )?;
 
-        // Non-special modules loaded in dependency order
-        let modules = [
-            ("internal.js", "@antithesishq/bombadil/internal"),
-            ("random.js", "@antithesishq/bombadil/random"),
-            ("actions.js", "@antithesishq/bombadil/actions"),
-        ];
-        for (file, import_path) in modules {
-            let module = load_bombadil_module(file, &mut context)?;
-            loader.insert_mapped_module(import_path, module);
-        }
+        // Add console object for compatibility with libraries that use console
+        let console_obj =
+            boa_engine::object::ObjectInitializer::new(&mut context)
+                .function(
+                    NativeFunction::from_copy_closure(
+                        |_this, args, _context| {
+                            log::info!("console.log: {:?}", args);
+                            Ok(JsValue::undefined())
+                        },
+                    ),
+                    js_string!("log"),
+                    0,
+                )
+                .function(
+                    NativeFunction::from_copy_closure(
+                        |_this, args, _context| {
+                            log::warn!("console.warn: {:?}", args);
+                            Ok(JsValue::undefined())
+                        },
+                    ),
+                    js_string!("warn"),
+                    0,
+                )
+                .function(
+                    NativeFunction::from_copy_closure(
+                        |_this, args, _context| {
+                            log::error!("console.error: {:?}", args);
+                            Ok(JsValue::undefined())
+                        },
+                    ),
+                    js_string!("error"),
+                    0,
+                )
+                .build();
+        context
+            .register_global_property(
+                js_string!("console"),
+                console_obj,
+                boa_engine::property::Attribute::all(),
+            )
+            .map_err(|e| {
+                SpecificationError::JS(format!(
+                    "Failed to register console: {}",
+                    e
+                ))
+            })?;
 
-        // Index module — special: needed for BombadilExports
-        let bombadil_module_index = {
-            let module = load_bombadil_module("index.js", &mut context)?;
-            loader
-                .insert_mapped_module("@antithesishq/bombadil", module.clone());
-            module
-        };
+        let specification_exports_value =
+            context.eval(Source::from_bytes(bundle_code))?;
+        let specification_exports_obj = specification_exports_value
+            .as_object()
+            .ok_or(SpecificationError::OtherError(
+                "specification exports is not an object".to_string(),
+            ))?;
 
-        // Modules that depend on index
-        let modules = [
-            (
-                "defaults/actions.js",
-                "@antithesishq/bombadil/defaults/actions",
-            ),
-            (
-                "defaults/properties.js",
-                "@antithesishq/bombadil/defaults/properties",
-            ),
-            ("defaults.js", "@antithesishq/bombadil/defaults"),
-        ];
-        for (file, import_path) in modules {
-            let module = load_bombadil_module(file, &mut context)?;
-            loader.insert_mapped_module(import_path, module);
-        }
+        let require_fn = context
+            .global_object()
+            .get(js_string!("__bombadilRequire"), &mut context)?
+            .as_callable()
+            .ok_or(SpecificationError::OtherError(
+                "__bombadilRequire is not a function".to_string(),
+            ))?;
 
-        let specification_module = {
-            let specification_bytes: &[u8] = &specification.contents;
-            Module::parse(
-                Source::from_reader(
-                    specification_bytes,
-                    Some(&specification.path),
-                ),
-                None,
-                &mut context,
-            )?
-        };
-        load_modules(
+        let bombadil_exports_value = require_fn.call(
+            &JsValue::undefined(),
+            &[js_string!("@antithesishq/bombadil").into()],
             &mut context,
-            std::slice::from_ref(&specification_module),
+        )?;
+        let bombadil_exports_obj = bombadil_exports_value.as_object().ok_or(
+            SpecificationError::OtherError(
+                "bombadil exports is not an object".to_string(),
+            ),
         )?;
 
-        let specification_exports =
-            module_exports(&specification_module, &mut context)?;
         let bombadil_exports =
-            BombadilExports::from_module(&bombadil_module_index, &mut context)?;
+            BombadilExports::from_object(&bombadil_exports_obj, &mut context)?;
+
+        let specification_export_keys =
+            specification_exports_obj.own_property_keys(&mut context)?;
 
         let mut properties: HashMap<String, Property> = HashMap::new();
         let mut action_generators: HashMap<String, ActionGenerator> =
             HashMap::new();
-        for (key, value) in specification_exports.iter() {
+        for key in specification_export_keys {
+            let value =
+                specification_exports_obj.get(key.clone(), &mut context)?;
             if value.instance_of(&bombadil_exports.formula, &mut context)? {
-                let syntax =
-                    Syntax::from_value(value, &bombadil_exports, &mut context)?;
+                let syntax = Syntax::from_value(
+                    &value,
+                    &bombadil_exports,
+                    &mut context,
+                )?;
                 let formula = syntax.nnf();
                 properties.insert(
                     key.to_string(),
@@ -212,9 +192,12 @@ impl Verifier {
                         function,
                     },
                 );
-            } else if let PropertyKey::Symbol(symbol) = key
+            } else if let PropertyKey::Symbol(ref symbol) = key
                 && let Some(description) = symbol.description()
                 && IGNORED_SYMBOL_EXPORTS.contains(&description)
+            {
+                continue;
+            } else if IGNORED_STRING_EXPORTS.contains(&key.to_string().as_str())
             {
                 continue;
             } else {
@@ -236,7 +219,7 @@ impl Verifier {
         let mut extractors = Extractors::new(&bombadil_exports);
 
         let extractors_value = bombadil_exports
-            .runtime_default
+            .runtime
             .get(js_string!("extractors"), &mut context)?;
         let extractors_array =
             JsArray::from_object(extractors_value.as_object().ok_or(
@@ -257,15 +240,12 @@ impl Verifier {
             );
         }
 
-        let extractor_functions = extractors.extract_functions(&mut context)?;
-
         Ok(Verifier {
             context,
             properties,
             action_generators,
             bombadil_exports,
             extractors,
-            extractor_functions,
         })
     }
 
@@ -273,17 +253,9 @@ impl Verifier {
         self.properties.keys().cloned().collect()
     }
 
-    pub fn extractors(&self) -> Result<Vec<(u64, String)>> {
-        let mut results = Vec::with_capacity(self.extractor_functions.len());
-        for (key, value) in &self.extractor_functions {
-            results.push((*key, value.clone()));
-        }
-        Ok(results)
-    }
-
     pub fn step<A: serde::de::DeserializeOwned>(
         &mut self,
-        snapshots: Vec<(u64, json::Value)>,
+        snapshots: Vec<json::Value>,
         time: ltl::Time,
     ) -> Result<StepResult<A>> {
         self.extractors.update_from_snapshots(
@@ -362,6 +334,7 @@ impl Verifier {
 }
 
 const IGNORED_SYMBOL_EXPORTS: &[JsString] = &[js_string!("Symbol.toStringTag")];
+const IGNORED_STRING_EXPORTS: &[&str] = &["__esModule"];
 
 #[derive(Debug, Clone)]
 pub struct Property {
@@ -417,16 +390,29 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
+    use tempfile::NamedTempFile;
+
     use crate::specification::stop::{StopDefault, stop_default};
 
     use super::*;
 
     fn verifier(specification: &str) -> Verifier {
-        Verifier::new(Specification {
-            path: PathBuf::from("fake.ts"),
-            contents: specification.to_string().into_bytes(),
-        })
-        .unwrap()
+        use crate::specification::bundler::bundle;
+
+        let mut specification_file = NamedTempFile::with_suffix(".ts").unwrap();
+        specification_file
+            .write_all(specification.as_bytes())
+            .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bundle_code = rt
+            .block_on(bundle(
+                ".",
+                &specification_file.path().display().to_string(),
+            ))
+            .unwrap();
+
+        Verifier::new(&bundle_code).unwrap()
     }
 
     #[test]
@@ -451,45 +437,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extractors() {
-        let evaluator = verifier(
-            r#"
-            import { actions, extract } from "@antithesishq/bombadil";
-            export const _actions = actions(() => []);
-
-            const notification_count = extract(
-              (state) => state.foo
-            );
-
-            function test() {
-                let local = extract(s => s.bar);
-                let other = extract(function foo(state) { return state.baz; });
-            }
-
-            test();
-            "#,
-        );
-
-        let mut extractors: Vec<String> = evaluator
-            .extractors()
-            .unwrap()
-            .iter()
-            .map(|(_, value)| value.clone())
-            .collect();
-
-        extractors.sort();
-
-        assert_eq!(
-            extractors,
-            vec![
-                "(state) => state.foo",
-                "function foo(state) { return state.baz; }",
-                "s => s.bar",
-            ]
-        );
-    }
-
-    #[test]
     fn test_property_evaluation_not() {
         let mut verifier = verifier(
             r#"
@@ -502,16 +449,12 @@ mod tests {
             "#,
         );
 
-        let extractors = verifier.extractors().unwrap();
-        let extractor_foo_id = extractors.first().unwrap().0;
-
         let time = SystemTime::UNIX_EPOCH
             .checked_add(Duration::from_millis(0))
             .unwrap();
 
-        let result: StepResult<json::Value> = verifier
-            .step(vec![(extractor_foo_id, json::json!(false))], time)
-            .unwrap();
+        let result: StepResult<json::Value> =
+            verifier.step(vec![(json::json!(false))], time).unwrap();
 
         let (name, value) = result.properties.first().unwrap();
         assert_eq!(*name, "my_prop");
@@ -532,22 +475,12 @@ mod tests {
             "#,
         );
 
-        let extractors = verifier.extractors().unwrap();
-        let extractor_foo_id = extractors.first().unwrap().0;
-        let extractor_bar_id = extractors.get(1).unwrap().0;
-
         let time = SystemTime::UNIX_EPOCH
             .checked_add(Duration::from_millis(0))
             .unwrap();
 
         let result: StepResult<json::Value> = verifier
-            .step(
-                vec![
-                    (extractor_foo_id, json::json!(true)),
-                    (extractor_bar_id, json::json!(true)),
-                ],
-                time,
-            )
+            .step(vec![json::json!(true), json::json!(true)], time)
             .unwrap();
 
         let (name, value) = result.properties.first().unwrap();
@@ -569,22 +502,12 @@ mod tests {
             "#,
         );
 
-        let extractors = verifier.extractors().unwrap();
-        let extractor_foo_id = extractors.first().unwrap().0;
-        let extractor_bar_id = extractors.get(1).unwrap().0;
-
         let time = SystemTime::UNIX_EPOCH
             .checked_add(Duration::from_millis(0))
             .unwrap();
 
         let result: StepResult<json::Value> = verifier
-            .step(
-                vec![
-                    (extractor_foo_id, json::json!(false)),
-                    (extractor_bar_id, json::json!(true)),
-                ],
-                time,
-            )
+            .step(vec![json::json!(false), json::json!(true)], time)
             .unwrap();
 
         let (name, value) = result.properties.first().unwrap();
@@ -606,22 +529,12 @@ mod tests {
             "#,
         );
 
-        let extractors = verifier.extractors().unwrap();
-        let extractor_foo_id = extractors.first().unwrap().0;
-        let extractor_bar_id = extractors.get(1).unwrap().0;
-
         let time = SystemTime::UNIX_EPOCH
             .checked_add(Duration::from_millis(0))
             .unwrap();
 
         let result: StepResult<json::Value> = verifier
-            .step(
-                vec![
-                    (extractor_foo_id, json::json!(false)),
-                    (extractor_bar_id, json::json!(false)),
-                ],
-                time,
-            )
+            .step(vec![json::json!(false), json::json!(false)], time)
             .unwrap();
 
         let (name, value) = result.properties.first().unwrap();
@@ -642,8 +555,6 @@ mod tests {
             "#,
         );
 
-        let extractor_id = verifier.extractors().unwrap().first().unwrap().0;
-
         let time_at = |i: u64| {
             SystemTime::UNIX_EPOCH
                 .checked_add(Duration::from_millis(i))
@@ -652,9 +563,8 @@ mod tests {
 
         for i in 0..=1 {
             let time = time_at(i);
-            let result: StepResult<json::Value> = verifier
-                .step(vec![(extractor_id, json::json!(i))], time)
-                .unwrap();
+            let result: StepResult<json::Value> =
+                verifier.step(vec![json::json!(i)], time).unwrap();
 
             let (name, value) = result.properties.first().unwrap();
             assert_eq!(*name, "my_prop");
@@ -688,8 +598,6 @@ mod tests {
             "#,
         );
 
-        let extractor_id = verifier.extractors().unwrap().first().unwrap().0;
-
         let time_at = |i: u64| {
             SystemTime::UNIX_EPOCH
                 .checked_add(Duration::from_millis(i))
@@ -698,9 +606,8 @@ mod tests {
 
         for i in 0..=100 {
             let time = time_at(0);
-            let result: StepResult<json::Value> = verifier
-                .step(vec![(extractor_id, json::json!(i))], time)
-                .unwrap();
+            let result: StepResult<json::Value> =
+                verifier.step(vec![json::json!(i)], time).unwrap();
 
             let (name, value) = result.properties.first().unwrap();
             assert_eq!(*name, "my_prop");
@@ -741,8 +648,6 @@ mod tests {
             "#,
         );
 
-        let extractor_id = verifier.extractors().unwrap().first().unwrap().0;
-
         let time_at = |i: u64| {
             SystemTime::UNIX_EPOCH
                 .checked_add(Duration::from_millis(i))
@@ -751,9 +656,8 @@ mod tests {
 
         for i in 0..10 {
             let time = time_at(i);
-            let result: StepResult<json::Value> = verifier
-                .step(vec![(extractor_id, json::json!(i))], time)
-                .unwrap();
+            let result: StepResult<json::Value> =
+                verifier.step(vec![json::json!(i)], time).unwrap();
 
             let (name, value) = result.properties.first().unwrap();
             assert_eq!(*name, "my_prop");
@@ -787,8 +691,6 @@ mod tests {
             "#,
         );
 
-        let extractor_id = verifier.extractors().unwrap().first().unwrap().0;
-
         let time_at = |i: u64| {
             SystemTime::UNIX_EPOCH
                 .checked_add(Duration::from_millis(i))
@@ -797,9 +699,8 @@ mod tests {
 
         for i in 0..10 {
             let time = time_at(i);
-            let result: StepResult<json::Value> = verifier
-                .step(vec![(extractor_id, json::json!(i))], time)
-                .unwrap();
+            let result: StepResult<json::Value> =
+                verifier.step(vec![json::json!(i)], time).unwrap();
 
             let (name, value) = result.properties.first().unwrap();
             assert_eq!(*name, "my_prop");
@@ -833,8 +734,6 @@ mod tests {
             "#,
         );
 
-        let extractor_id = verifier.extractors().unwrap().first().unwrap().0;
-
         let time_at = |i: u64| {
             SystemTime::UNIX_EPOCH
                 .checked_add(Duration::from_millis(i))
@@ -843,9 +742,8 @@ mod tests {
 
         for i in 0..10 {
             let time = time_at(i);
-            let result: StepResult<json::Value> = verifier
-                .step(vec![(extractor_id, json::json!(i))], time)
-                .unwrap();
+            let result: StepResult<json::Value> =
+                verifier.step(vec![json::json!(i)], time).unwrap();
 
             let (name, value) = result.properties.first().unwrap();
             assert_eq!(*name, "my_prop");
@@ -864,33 +762,5 @@ mod tests {
                 assert!(matches!(value, ltl::Value::False(_)));
             }
         }
-    }
-
-    #[test]
-    fn test_load_ts_file() {
-        let mut imported_file =
-            tempfile::NamedTempFile::with_suffix(".ts").unwrap();
-        imported_file
-            .write_all(
-                r#"
-                import { extract } from "@antithesishq/bombadil";
-                const example = extract((state) => state.example);
-                "#
-                .as_bytes(),
-            )
-            .unwrap();
-
-        let verifier = verifier(&format!(
-            r#"
-            import {{ actions }} from "@antithesishq/bombadil";
-            export const _actions = actions(() => []);
-            export * from "{}";
-            "#,
-            imported_file.path().display(),
-        ));
-
-        let extractors = verifier.extractors().unwrap();
-        let (_, name) = extractors.first().unwrap();
-        assert_eq!(name, "(state) => state.example");
     }
 }

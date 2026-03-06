@@ -1,7 +1,8 @@
+pub mod bundler;
 pub mod js;
 pub mod ltl;
-pub(crate) mod module_loader;
 pub mod render;
+pub mod resolver;
 pub mod result;
 pub mod stop;
 pub mod syntax;

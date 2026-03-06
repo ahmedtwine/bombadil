@@ -1,7 +1,8 @@
 use anyhow::anyhow;
 use axum::Router;
-use std::{fmt::Display, path::PathBuf, sync::Once, time::Duration};
-use tempfile::TempDir;
+use std::io::Write;
+use std::{fmt::Display, sync::Once, time::Duration};
+use tempfile::{NamedTempFile, TempDir};
 use tokio::sync::Semaphore;
 use tower_http::services::ServeDir;
 use url::Url;
@@ -66,7 +67,7 @@ async fn run_browser_test(
     name: &str,
     expect: Expect,
     timeout: Duration,
-    spec: Option<&str>,
+    specification: Option<&str>,
 ) {
     setup();
     let _permit = TEST_SEMAPHORE.acquire().await.unwrap();
@@ -103,17 +104,25 @@ async fn run_browser_test(
         Url::parse(&format!("http://localhost:{}/{}", port, name,)).unwrap();
     let user_data_directory = TempDir::new().unwrap();
 
-    let spec_source =
-        spec.unwrap_or(r#"export * from "@antithesishq/bombadil/defaults";"#);
-    let default_specification = Specification::from_string(
-        spec_source,
-        PathBuf::from("fake.ts").as_path(),
-    )
-    .unwrap();
+    let mut specification_file = NamedTempFile::with_suffix(".ts").unwrap();
+    let specification = match specification {
+        Some(spec) => {
+            specification_file.write_all(spec.as_bytes()).unwrap();
+            Specification {
+                module_specifier: specification_file
+                    .path()
+                    .display()
+                    .to_string(),
+            }
+        }
+        None => Specification {
+            module_specifier: "@antithesishq/bombadil/defaults".to_string(),
+        },
+    };
 
     let runner = Runner::new(
         origin,
-        default_specification,
+        specification,
         RunnerOptions {
             stop_on_violation: true,
         },
@@ -455,6 +464,56 @@ const decrement = now(() => {
 
 export const counterStateMachine = always(unchanged.or(increment).or(decrement));
 "#,
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_time_extractor() {
+    run_browser_test(
+        "time-extractor",
+        Expect::Success,
+        Duration::from_secs(10),
+        Some(
+            r##"
+import { actions, extract, now, eventually, time } from "@antithesishq/bombadil";
+export { clicks } from "@antithesishq/bombadil/defaults";
+
+const myTime = extract((state) => time.current);
+
+// Property: time is a reasonable value (after year 2020)
+export const time_is_reasonable = now(() => {
+  const start = myTime.current;
+  return eventually(() =>
+      myTime.current > start
+  );
+});
+"##,
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_extractor_guard() {
+    run_browser_test(
+        "extractor-guard",
+        Expect::Error {
+            substring: "Cannot access cell.current from within an extractor",
+        },
+        Duration::from_secs(5),
+        Some(
+            r##"
+import { actions, extract } from "@antithesishq/bombadil";
+export { clicks } from "@antithesishq/bombadil/defaults";
+
+// First extractor
+const foo = extract((state) => state.document.title);
+
+// Second extractor tries to access the first - this should fail
+const bar = extract((state) => foo.current);
+"##,
         ),
     )
     .await;
